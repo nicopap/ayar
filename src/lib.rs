@@ -68,7 +68,6 @@
 
 pub use crate::archive::{Archive, Variant};
 pub use crate::builder::Builder;
-pub use crate::builder::GnuBuilder;
 pub use crate::entry::Entry;
 pub use crate::header::Header;
 pub use crate::symbols::Symbols;

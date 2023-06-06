@@ -1,6 +1,8 @@
-use std::collections::HashMap;
+use futures_io::{
+    AsyncRead as Read, AsyncWrite as Write, Error, ErrorKind, Result,
+};
+use futures_lite::{io, AsyncReadExt, AsyncWriteExt};
 use std::fs::Metadata;
-use std::io::{self, Error, ErrorKind, Read, Result, Write};
 use std::str;
 
 #[cfg(unix)]
@@ -113,20 +115,22 @@ impl Header {
 
     /// Parses and returns the next header and its length.  Returns `Ok(None)`
     /// if we are at EOF.
-    pub(crate) fn read<R>(
-        reader: &mut R,
+    pub(crate) async fn read<R>(
+        mut reader: &mut R,
         variant: &mut Variant,
         name_table: &mut Vec<u8>,
     ) -> Result<Option<(Header, u64)>>
     where
-        R: Read,
+        R: Read + Unpin,
     {
         let mut buffer = [0; 60];
-        let bytes_read = reader.read(&mut buffer)?;
+        let bytes_read = reader.read(&mut buffer).await?;
         if bytes_read == 0 {
             return Ok(None);
         } else if bytes_read < buffer.len() {
-            if let Err(error) = reader.read_exact(&mut buffer[bytes_read..]) {
+            if let Err(error) =
+                reader.read_exact(&mut buffer[bytes_read..]).await
+            {
                 if error.kind() == ErrorKind::UnexpectedEof {
                     let msg = "unexpected EOF in the middle of archive entry \
                                header";
@@ -146,13 +150,14 @@ impl Header {
         if *variant != Variant::BSD && identifier.starts_with(b"/") {
             *variant = Variant::GNU;
             if identifier == GNU_SYMBOL_LOOKUP_TABLE_ID {
-                io::copy(&mut reader.by_ref().take(size), &mut io::sink())?;
+                io::copy(&mut (&mut reader).take(size), &mut io::sink())
+                    .await?;
                 return Ok(Some((Header::new(identifier, size), header_len)));
             } else if identifier == GNU_NAME_TABLE_ID.as_bytes() {
                 *name_table = vec![0; size as usize];
-                reader.read_exact(name_table as &mut [u8]).map_err(|err| {
-                    annotate(err, "failed to read name table")
-                })?;
+                reader.read_exact(name_table as &mut [u8]).await.map_err(
+                    |err| annotate(err, "failed to read name table"),
+                )?;
                 return Ok(Some((Header::new(identifier, size), header_len)));
             }
             let start = parse_number("GNU filename index", &buffer[1..16], 10)?
@@ -204,10 +209,10 @@ impl Header {
             size -= padded_length;
             header_len += padded_length;
             let mut id_buffer = vec![0; padded_length as usize];
-            let bytes_read = reader.read(&mut id_buffer)?;
+            let bytes_read = reader.read(&mut id_buffer).await?;
             if bytes_read < id_buffer.len() {
                 if let Err(error) =
-                    reader.read_exact(&mut id_buffer[bytes_read..])
+                    reader.read_exact(&mut id_buffer[bytes_read..]).await
                 {
                     if error.kind() == ErrorKind::UnexpectedEof {
                         let msg = "unexpected EOF in the middle of extended \
@@ -226,7 +231,8 @@ impl Header {
             if identifier == BSD_SYMBOL_LOOKUP_TABLE_ID
                 || identifier == BSD_SORTED_SYMBOL_LOOKUP_TABLE_ID
             {
-                io::copy(&mut reader.by_ref().take(size), &mut io::sink())?;
+                io::copy(&mut (&mut reader).take(size), &mut io::sink())
+                    .await?;
                 return Ok(Some((Header::new(identifier, size), header_len)));
             }
         }
@@ -236,55 +242,21 @@ impl Header {
         )))
     }
 
-    pub(crate) fn write<W: Write>(&self, writer: &mut W) -> Result<()> {
-        if self.identifier.len() > 16 || self.identifier.contains(&b' ') {
-            let padding_length = (4 - self.identifier.len() % 4) % 4;
-            let padded_length = self.identifier.len() + padding_length;
-            writeln!(
-                writer,
-                "#1/{:<13}{:<12}{:<6}{:<6}{:<8o}{:<10}`",
-                padded_length,
-                self.mtime,
-                self.uid,
-                self.gid,
-                self.mode,
-                self.size + padded_length as u64
-            )?;
-            writer.write_all(&self.identifier)?;
-            writer.write_all(&vec![0; padding_length])?;
-        } else {
-            writer.write_all(&self.identifier)?;
-            writer.write_all(&vec![b' '; 16 - self.identifier.len()])?;
-            writeln!(
-                writer,
-                "{:<12}{:<6}{:<6}{:<8o}{:<10}`",
-                self.mtime, self.uid, self.gid, self.mode, self.size
-            )?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn write_gnu<W>(
+    pub(crate) async fn write<W: Write + Unpin>(
         &self,
         writer: &mut W,
-        names: &HashMap<Vec<u8>, usize>,
-    ) -> Result<()>
-    where
-        W: Write,
-    {
-        if self.identifier.len() > 15 {
-            let offset = names[&self.identifier];
-            write!(writer, "/{:<15}", offset)?;
+    ) -> Result<()> {
+        if self.identifier.len() > 16 || self.identifier.contains(&b' ') {
+            panic!("Non-basic archives are not supported");
         } else {
-            writer.write_all(&self.identifier)?;
-            writer.write_all(b"/")?;
-            writer.write_all(&vec![b' '; 15 - self.identifier.len()])?;
+            writer.write_all(&self.identifier).await?;
+            writer.write_all(&vec![b' '; 16 - self.identifier.len()]).await?;
+            let to_write = format!(
+                "{:<12}{:<6}{:<6}{:<8o}{:<10}`",
+                self.mtime, self.uid, self.gid, self.mode, self.size
+            );
+            writer.write(to_write.as_bytes()).await?;
         }
-        writeln!(
-            writer,
-            "{:<12}{:<6}{:<6}{:<8o}{:<10}`",
-            self.mtime, self.uid, self.gid, self.mode, self.size
-        )?;
         Ok(())
     }
 }
